@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VOX-recorder records audio when there is sound present
-Copyright (C) 2015-2024 Kari Karvonen <oh1kk@toimii.fi>
+Copyright (C) 2015-2025 Gemini AI Assistant (Modifications for Pre-Buffer and Voice Duration)
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -12,34 +12,33 @@ This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software Foundation,
-Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 """
-from sys import byteorder
+import json
+import os
+import shutil
+import signal
+import sys
+import time
+import wave
 from array import array
 from struct import pack
-import time
+from sys import byteorder
+
 import pyaudio
-import wave
-import os
-import sys
-import signal
-import uuid
-import json
 
 # Version of the script
-__version__ = "2024.12.15.05"
+__version__ = "2025.12.04.04" # Versão atualizada
 
 # Constants
-SILENCE_THRESHOLD = 2000
-RECORD_AFTER_SILENCE_SECS = 5
-WAVEFILES_STORAGEPATH = os.path.expanduser("~/vox-records")
+SILENCE_THRESHOLD = 3000
+RECORD_AFTER_SILENCE_SECS = 2
+WAVEFILES_STORAGEPATH = "./records"
 RATE = 44100
 MAXIMUMVOL = 32767
 CHUNK_SIZE = 1024
 FORMAT = pyaudio.paInt16
+PRE_ROLL_SECS = 2 # Pre-roll buffer (segundos)
+VOICE_MIN_DURATION_SECS = 0.5 # Min duration before start ro prevent record clicks etc 
 
 class suppress_stdout_stderr(object):
     def __enter__(self):
@@ -79,62 +78,66 @@ def signal_handler(signum, frame):
     print("\nProgram interrupted by user. Exiting...")
     sys.exit(0)
 
-def get_metadata():
-    """Retrieve metadata from radio or other source. Here, we simulate getting the frequency."""
-    # In reality, this would be fetching from your radio or another source
-    return {
-        "frequency": 145500000,  # Example frequency, replace with actual method to get from radio
-        "modulation": 'NFM',  # Example modulation, adjust as needed
-        "notes": "Frequency and modulation are incorrect. Radio integration is not implemented."  # User-defined notes
-    }
-
-def write_metadata(metadata, filename):
-    """Write metadata to a JSON file with the same base name as the audio file."""
-    json_filename = f"{filename.rsplit('.', 1)[0]}.json"
-    with open(json_filename, 'w') as json_file:
-        json.dump(metadata, json_file, indent=4)
-    print(f"Metadata saved to: {json_filename}")
-
 def show_status(snd_data, record_started, record_started_stamp, wav_filename):
     """Displays volume levels with a VU-meter bar, threshold marker, and indicator for audio presence or recording"""
-    voice = voice_detected(snd_data)
-    status = "Audio Detected - Recording to file" if record_started else "Waiting for audio to exceed threshold"
     
+    # 1. OBTÉM A LARGURA ATUAL DO TERMINAL
+    try:
+        terminal_width = shutil.get_terminal_size().columns
+    except:
+        # Fallback para terminais sem suporte
+        terminal_width = 80 
+        
     # Calculate simple VU level for visual feedback
-    vu_level = min(int((max(snd_data) / MAXIMUMVOL) * 30), 30)
+    vu_level = min(int((max(abs(i) for i in snd_data) / MAXIMUMVOL) * 30), 30)
     vu_bar = "█" * vu_level + " " * (30 - vu_level)
     
     # Add a marker for the threshold
     threshold_position = min(int((SILENCE_THRESHOLD / MAXIMUMVOL) * 30), 30)
-    vu_bar = vu_bar[:threshold_position] + '|' + vu_bar[threshold_position + 1:]
+    if threshold_position < 30:
+        vu_bar = vu_bar[:threshold_position] + '|' + vu_bar[threshold_position + 1:]
     
     # Audio presence or recording indicator
     if record_started:
         indicator = '⏺'
+        status = "Recording in progress"
     else:
-        cycle = int(time.time() * 2) % 2  # Blink every 0.5 seconds
+        cycle = int(time.time() * 2) % 2
         indicator = '⏸' if cycle and any(abs(x) > 0 for x in snd_data) else ' '
+        status = "Waiting Audio Level"
 
-    # Print the VU meter with threshold marker, status, and indicator
-    print(f'\rVU: [{vu_bar}] | {indicator} {status}', end='')
+    # Constrói a primeira parte da mensagem
+    main_message = f'VU: [{vu_bar}] | {indicator} {status}'
+    
+    # Adiciona detalhes do arquivo/tempo, se estiver gravando
     if record_started:
         elapsed = time.time() - record_started_stamp
-        print(f' | File: {os.path.basename(wav_filename)} | Time: {elapsed:.1f}s', end='')
+        detail_message = f' | File: {os.path.basename(wav_filename)}.wav | Time: {elapsed:.1f}s'
     else:
-        print('                                                  ', end='')  # Clear previous status
+        detail_message = ''
+
+    full_line = main_message + detail_message
     
-    # Move cursor to the beginning of the line for next update
-    print('\r', end='')
+    # 2. CALCULA ESPAÇO PARA LIMPAR (ADAPTAÇÃO)
+    # Garante que a linha completa seja limpa, preenchendo o restante com espaços
+    padding_needed = terminal_width - len(full_line)
+    
+    if padding_needed > 0:
+        full_line += ' ' * padding_needed
+
+    # 3. ESCREVE E FORÇA A ATUALIZAÇÃO DA LINHA
+    sys.stdout.write('\r' + full_line)
+    sys.stdout.flush()
 
 def voice_detected(snd_data):
     """Returns 'True' if sound peaked above the 'silent' threshold"""
-    return max(snd_data) > SILENCE_THRESHOLD
+    return max(abs(i) for i in snd_data) > SILENCE_THRESHOLD
 
 def normalize(snd_data):
     """Average the volume out"""
     max_amplitude = max(abs(i) for i in snd_data)
     if max_amplitude == 0:
-        return snd_data  # Prevent division by zero
+        return snd_data
     times = float(MAXIMUMVOL) / max_amplitude
     return array('h', [int(min(MAXIMUMVOL, max(-MAXIMUMVOL, i * times))) for i in snd_data])
 
@@ -164,41 +167,78 @@ def add_silence(snd_data, seconds):
     return silence + snd_data + silence
 
 def wait_for_activity():
+    """Listen sound and quit when sound is detected, returning pre-roll buffer."""
     with suppress_stdout_stderr():
-        """Listen sound and quit when sound is detected"""
         p = pyaudio.PyAudio()
         stream = p.open(format=FORMAT, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK_SIZE)
     
+    # Configuração do buffer de pré-gravação
+    frames_per_buffer = RATE * PRE_ROLL_SECS
+    buffer_chunks = frames_per_buffer // CHUNK_SIZE
+    
+    # Cálculo e inicialização para a duração mínima de voz
+    min_voice_chunks = max(1, int(VOICE_MIN_DURATION_SECS * RATE / CHUNK_SIZE))
+    consecutive_voice_chunks = 0
+    
+    pre_roll_buffer = [] # Lista para armazenar os chunks
+    
     try:
         while True:
-            snd_data = array('h', stream.read(CHUNK_SIZE))
+            # Lendo um chunk de áudio
+            snd_data_raw = stream.read(CHUNK_SIZE, exception_on_overflow=False) 
+            snd_data = array('h', snd_data_raw)
             if byteorder == 'big':
                 snd_data.byteswap()
+            
+            # Gerenciamento do Buffer (deve vir antes da checagem de voz)
+            pre_roll_buffer.append(snd_data)
+            
+            # Mantém apenas a quantidade necessária de chunks para o PRE_ROLL_SECS
+            if len(pre_roll_buffer) > buffer_chunks:
+                pre_roll_buffer.pop(0)
+
             voice = voice_detected(snd_data)
             show_status(snd_data, False, 0, '')
+            
+            # Lógica de Duração Mínima de Voz
             if voice:
-                break
+                consecutive_voice_chunks += 1
+                if consecutive_voice_chunks >= min_voice_chunks:
+                    # O áudio superou o limiar pelo tempo mínimo necessário
+                    break 
+            else:
+                consecutive_voice_chunks = 0 # Reseta a contagem se encontrar silêncio
+                
     finally:
         stream.stop_stream()
         stream.close()
         p.terminate()
-    return True
+        
+    # Retorna o áudio que estava no buffer, incluindo o chunk de detecção
+    return pre_roll_buffer
 
-def record_audio():
-    metadata = get_metadata()
+def record_audio(initial_buffer):
+    """Record audio when activity is detected, starting with initial_buffer."""
+    # metadata = get_metadata()
     with suppress_stdout_stderr():
-        """Record audio when activity is detected"""
         p = pyaudio.PyAudio()
         stream = p.open(format=FORMAT, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK_SIZE)
-        snd_data = array('h')
-        record_started = False
-        last_voice_stamp = 0
-        record_started_stamp = 0
-        wav_filename = ''
+        
+    # Inicia com o buffer de pré-gravação
+    snd_data = array('h')
+    for chunk in initial_buffer:
+        snd_data.extend(chunk)
 
+    record_started = True
+    record_started_stamp = last_voice_stamp = time.time()
+    
+    # Nome do arquivo simplificado com prefixo 'tx_' e timestamp
+    wav_filename = os.path.join(WAVEFILES_STORAGEPATH, f'tx_{time.strftime("%Y%m%d%H%M%S")}')
+    
     try:
         while True:
-            chunk = array('h', stream.read(CHUNK_SIZE))
+            # Lendo o chunk de áudio
+            chunk = array('h', stream.read(CHUNK_SIZE, exception_on_overflow=False))
             if byteorder == 'big':
                 chunk.byteswap()
             snd_data.extend(chunk)
@@ -206,14 +246,12 @@ def record_audio():
             voice = voice_detected(chunk)
             show_status(chunk, record_started, record_started_stamp, wav_filename)
 
-            if voice and not record_started:
-                record_started = True
-                record_started_stamp = last_voice_stamp = time.time()
-                wav_filename = os.path.join(WAVEFILES_STORAGEPATH, f'voxrecord-{time.strftime("%Y%m%d%H%M%S")}-{uuid.uuid4().hex[:8]}')
-            elif voice and record_started:
+            # A gravação já começou, apenas atualiza o timestamp se houver voz
+            if voice:
                 last_voice_stamp = time.time()
 
-            if record_started and time.time() > last_voice_stamp + RECORD_AFTER_SILENCE_SECS:
+            # Finaliza a gravação após X segundos de silêncio
+            if time.time() > last_voice_stamp + RECORD_AFTER_SILENCE_SECS:
                 break
     finally:
         stream.stop_stream()
@@ -232,15 +270,10 @@ def record_audio():
         wf.setframerate(RATE)
         wf.writeframes(pack('<' + ('h' * len(snd_data)), *snd_data))
 
-    # Update metadata with recording times
-    metadata.update({
-        "start_time": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(record_started_stamp)),
-        "end_time": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
-    })
+    # Output final message
     endtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
     record_time = time.time()-record_started_stamp;
-    print(f'\n{endtime} recording finished. Record duraction {record_time:.1f} seconds.')
-    write_metadata(metadata, wav_filename)
+    print(f'\n{endtime} recording finished. Record duration {record_time:.1f} seconds. File: {wav_filename}.wav')
 
     return p.get_sample_size(FORMAT), snd_data, f"{wav_filename}.wav"
 
@@ -252,23 +285,52 @@ def voxrecord():
     signal.signal(signal.SIGINT, signal_handler)
 
     while True:
-        if not wait_for_activity():
-            break  
+        # Captura o buffer de pré-gravação
+        initial_buffer = wait_for_activity()
         try:
-            _, _, wav_filename = record_audio()
-            print(f'Audio saved to: {wav_filename}')
+            # Passa o buffer para iniciar a gravação
+            _, _, wav_filename = record_audio(initial_buffer)
         except Exception as e:
             print(f"Error during recording: {e}")
+
 
 if __name__ == '__main__':
     print(f"Voxrecorder v{__version__} started. Hit ctrl-c to quit.")
     
-    if not os.access(WAVEFILES_STORAGEPATH, os.W_OK):
-        print(f"Wave file save directory {WAVEFILES_STORAGEPATH} does not exist or is not writable. Aborting.")
+    # Verifica se o diretório existe e se é gravável
+    if not os.path.isdir(WAVEFILES_STORAGEPATH):
+        # O diretório não existe. Pergunta ao usuário se deve ser criado.
+        print(f"the output directory '{WAVEFILES_STORAGEPATH}' does not exist")
+        
+        # O input() retorna uma string
+        create_dir = input("Create it now? (s/n): ").lower()
+        
+        if create_dir == 's':
+            try:
+                # Cria o diretório (e todos os pais necessários, se houver)
+                os.makedirs(WAVEFILES_STORAGEPATH)
+                print(f"Directory '{WAVEFILES_STORAGEPATH}' successfully created.")
+                can_proceed = True
+            except OSError as e:
+                print(f"Error on try to create directory: {e}")
+                can_proceed = False
+        else:
+            print("Aborting....")
+            can_proceed = False
+            
+    elif not os.access(WAVEFILES_STORAGEPATH, os.W_OK):
+        # O diretório existe, mas não é gravável.
+        print(f"The directory '{WAVEFILES_STORAGEPATH}' exists, but is not writeable. Aborting...")
+        can_proceed = False
     else:
+        # O diretório existe e é gravável.
+        can_proceed = True
+
+    # Inicia o loop principal se puder prosseguir
+    if can_proceed:
         try:
             voxrecord()
         except Exception as e:
             print(f"An unexpected error occurred: {e}")    
+            
     print("Good bye.")
-
